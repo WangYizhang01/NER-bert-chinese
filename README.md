@@ -1,3 +1,15 @@
+# 利用Bert进行fine-tune，用于NER任务
+
+
+# What's New
+
+## Updated June, 2022
+* 增加了在bert顶层添加crf层的设计，在给定数据集上实现了average f1  1个点的提升，可通过修改 ./conf/train.yaml 中 use_crf 进行设定
+* 推理时增加了批预测的情形，考虑到推理文本量，实现时未采用批计算的方法，会对推理速度产生影响，后续可考虑实现批计算
+
+
+# 快速开始
+
 ### 环境依赖
 
 > python == 3.8 
@@ -36,8 +48,10 @@
 ### 模型内容
 
 BERT
+[CRF](https://createmomo.github.io/2017/09/12/CRF_Layer_on_the_Top_of_BiLSTM_1/)
 
 
 ### 参考
 https://github.com/zjunlp/DeepKE
+
 

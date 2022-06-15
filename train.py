@@ -21,8 +21,6 @@ from bert_model import *
 
 import wandb
 
-import sys
-print(f'sys.path: {sys.path}')
 
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
@@ -31,6 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 class TrainNer(BertForTokenClassification):
+    def __init__(self, config, use_crf=False):
+        super(TrainNer, self).__init__(config)
+        self.use_crf = use_crf
+        if self.use_crf:
+            self.crf = CRF(config.hidden_size, config.num_labels)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=None, attention_mask_label=None, device=None):
         sequence_output = self.bert(input_ids, token_type_ids, attention_mask,head_mask=None)[0]
@@ -42,23 +45,34 @@ class TrainNer(BertForTokenClassification):
                     if valid_ids[i][j].item() == 1:
                         jj += 1
                         valid_output[i][jj] = sequence_output[i][j]
-        sequence_output = self.dropout(valid_output)
-        logits = self.classifier(sequence_output)
-
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss(ignore_index=0)
-            if attention_mask_label is not None:
-                active_loss = attention_mask_label.view(-1) == 1
-                active_logits = logits.view(-1, self.num_labels)[active_loss]
-                active_labels = labels.view(-1)[active_loss]
-                loss = loss_fct(active_logits, active_labels)
+        sequence_output = self.dropout(valid_output) # 32, 128, 768
+        
+        if self.use_crf:
+            if labels is not None:
+                masks = input_ids.gt(0)
+                loss = self.crf.loss(sequence_output, labels, masks)
+                return loss
             else:
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            return loss
+                masks = input_ids.gt(0)
+                scores, tag_seq = self.crf(sequence_output, masks)
+                return scores, tag_seq
         else:
-            return logits
+            logits = self.classifier(sequence_output) # 32, 128, 10
 
-wandb.init(project="DeepKE_NER_Standard")
+            if labels is not None: # labels: 32, 128
+                loss_fct = nn.CrossEntropyLoss(ignore_index=0)
+                if attention_mask_label is not None:
+                    active_loss = attention_mask_label.view(-1) == 1
+                    active_logits = logits.view(-1, self.num_labels)[active_loss] # 1436, 10
+                    active_labels = labels.view(-1)[active_loss] # 1436
+                    loss = loss_fct(active_logits, active_labels)
+                else:
+                    loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+                return loss
+            else:
+                return logits
+
+wandb.init(project="Bert_NER_Standard")
 @hydra.main(config_path="conf", config_name='config')
 def main(cfg):
     
@@ -82,6 +96,8 @@ def main(cfg):
 
     # Checkpoints
     # 训练模式下，若输出文件夹已存在且非空，报错，否则生成输出文件夹
+    cfg.output_dir += '_with_crf' if cfg.use_crf else ''
+    print(f'output_dir: {cfg.output_dir}')
     if os.path.exists(utils.get_original_cwd()+'/'+cfg.output_dir) and os.listdir(utils.get_original_cwd()+'/'+cfg.output_dir) and cfg.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(utils.get_original_cwd()+'/'+cfg.output_dir))
     if not os.path.exists(utils.get_original_cwd()+'/'+cfg.output_dir):
@@ -104,8 +120,8 @@ def main(cfg):
 
     # 加载预训练模型
     config = BertConfig.from_pretrained(cfg.bert_model, num_labels=num_labels, finetuning_task=cfg.task_name)
-    model = TrainNer.from_pretrained(cfg.bert_model,from_tf = False,config = config)
-    # model = TrainNer.from_pretrained('/home/wangyizhang/work/KG/NER-bert-chinese/pretrained/bert-base-chinese',from_tf = False,config = config)
+    # model = TrainNer.from_pretrained(cfg.bert_model,from_tf = False,config = config, use_crf = cfg.use_crf)
+    model = TrainNer.from_pretrained('/home/wangyizhang/work/KG/NER-bert-chinese/pretrained/bert-base-chinese',from_tf = False,config = config, use_crf = cfg.use_crf)
     model.to(device)
 
     param_optimizer = list(model.named_parameters())
@@ -167,10 +183,9 @@ def main(cfg):
         label_map = {i : label for i, label in enumerate(label_list,1)}
         model_config = {"bert_model":cfg.bert_model,"do_lower":cfg.do_lower_case,"max_seq_length":cfg.max_seq_length,"num_labels":len(label_list)+1,"label_map":label_map}
         json.dump(model_config,open(os.path.join(utils.get_original_cwd()+'/'+cfg.output_dir,"model_config.json"),"w"))
-        # Load a trained model and config that you have fine-tuned
     else:
         # Load a trained model and vocabulary that you have fine-tuned
-        model = TrainNer.from_pretrained(utils.get_original_cwd()+'/'+cfg.output_dir)
+        model = TrainNer.from_pretrained(utils.get_original_cwd()+'/'+cfg.output_dir, use_crf = cfg.use_crf)
         tokenizer = BertTokenizer.from_pretrained(utils.get_original_cwd()+'/'+cfg.output_dir, do_lower_case=cfg.do_lower_case)
 
     model.to(device)
@@ -207,13 +222,18 @@ def main(cfg):
             label_ids = label_ids.to(device)
             l_mask = l_mask.to(device)
 
-            with torch.no_grad():
-                logits = model(input_ids, segment_ids, input_mask,valid_ids=valid_ids,attention_mask_label=l_mask,device=device)
+            if cfg.use_crf:
+                with torch.no_grad():
+                    _, logits = model(input_ids, segment_ids, input_mask,valid_ids=valid_ids,attention_mask_label=l_mask,device=device)
+            else:
+                with torch.no_grad():
+                    logits = model(input_ids, segment_ids, input_mask,valid_ids=valid_ids,attention_mask_label=l_mask,device=device)
 
-            logits = torch.argmax(F.log_softmax(logits,dim=2),dim=2)
-            logits = logits.detach().cpu().numpy()
-            label_ids = label_ids.to('cpu').numpy()
-            input_mask = input_mask.to('cpu').numpy()
+                logits = torch.argmax(F.log_softmax(logits,dim=2),dim=2)
+                logits = logits.detach().cpu().numpy()
+                
+            label_ids = label_ids.to('cpu').numpy() # 8, 128
+            input_mask = input_mask.to('cpu').numpy() # 8, 128
 
             for i, label in enumerate(label_ids):
                 temp_1 = []
@@ -221,7 +241,7 @@ def main(cfg):
                 for j,m in enumerate(label):
                     if j == 0:
                         continue
-                    elif label_ids[i][j] == len(label_map):
+                    if label_ids[i][j] == len(label_map):
                         y_true.append(temp_1)
                         y_pred.append(temp_2)
                         break
@@ -231,10 +251,9 @@ def main(cfg):
                         if logits[i][j] != 0:
                             temp_2.append(label_map[logits[i][j]])
                         else:
-                            temp_2.append(0)
+                            temp_2.append('0')
 
-
-        report = classification_report(y_true, y_pred,digits=4)
+        report = classification_report(y_true, y_pred, digits=4)
         logger.info("\n%s", report)
         output_eval_file = os.path.join(utils.get_original_cwd()+'/'+cfg.output_dir, "eval_results.txt")
         with open(output_eval_file, "w") as writer:

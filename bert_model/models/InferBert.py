@@ -11,12 +11,18 @@ from collections import OrderedDict
 
 import hydra
 from hydra import utils
+from .crf import CRF
 
 
 class BertNer(BertForTokenClassification):
+    def __init__(self, config, use_crf=False):
+        super(BertNer, self).__init__(config)
+        self.use_crf = use_crf
+        if self.use_crf:
+            self.crf = CRF(config.hidden_size, config.num_labels)
 
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, valid_ids=None):
-        sequence_output = self.bert(input_ids, token_type_ids, attention_mask, head_mask=None)[0]
+        sequence_output = self.bert(input_ids, token_type_ids, attention_mask,head_mask=None)[0]
         batch_size,max_len,feat_dim = sequence_output.shape
         valid_output = torch.zeros(batch_size,max_len,feat_dim,dtype=torch.float32,device='cuda' if torch.cuda.is_available() else 'cpu')
         for i in range(batch_size):
@@ -25,13 +31,20 @@ class BertNer(BertForTokenClassification):
                     if valid_ids[i][j].item() == 1:
                         jj += 1
                         valid_output[i][jj] = sequence_output[i][j]
-        sequence_output = self.dropout(valid_output)
-        logits = self.classifier(sequence_output)
-        return logits
+        sequence_output = self.dropout(valid_output) # 32, 128, 768
+        
+        if self.use_crf:
+            masks = input_ids.gt(0)
+            scores, tag_seq = self.crf(sequence_output, masks)
+            return scores, tag_seq
+        else:
+            logits = self.classifier(sequence_output) # 32, 128, 10
+            return logits
 
-class InferNer:
 
-    def __init__(self,model_dir: str):
+class InferNer():
+    def __init__(self,model_dir: str, use_crf=False):
+        self.use_crf = use_crf
         self.model , self.tokenizer, self.model_config = self.load_model(model_dir)
         self.label_map = self.model_config["label_map"]
         self.max_seq_length = self.model_config["max_seq_length"]
@@ -43,7 +56,7 @@ class InferNer:
     def load_model(self, model_dir: str, model_config: str = "model_config.json"):
         model_config = os.path.join(model_dir,model_config)
         model_config = json.load(open(model_config))
-        model = BertNer.from_pretrained(model_dir)
+        model = BertNer.from_pretrained(model_dir, use_crf=self.use_crf)
         tokenizer = BertTokenizer.from_pretrained(model_dir, do_lower_case=model_config["do_lower"])
         return model, tokenizer, model_config
 
@@ -83,39 +96,54 @@ class InferNer:
             valid_positions.append(0)
         return input_ids,input_mask,segment_ids,valid_positions
 
-    def predict(self, text: str):
+    def predict(self, text: str):        
         input_ids,input_mask,segment_ids,valid_ids = self.preprocess(text)
         input_ids = torch.tensor([input_ids],dtype=torch.long,device=self.device)
         input_mask = torch.tensor([input_mask],dtype=torch.long,device=self.device)
         segment_ids = torch.tensor([segment_ids],dtype=torch.long,device=self.device)
         valid_ids = torch.tensor([valid_ids],dtype=torch.long,device=self.device)
-        with torch.no_grad():
-            logits = self.model(input_ids, segment_ids, input_mask,valid_ids)
-        logits = F.softmax(logits,dim=2)
-        logits_label = torch.argmax(logits,dim=2)
-        logits_label = logits_label.detach().cpu().numpy().tolist()[0]
+        
+        if self.use_crf:
+            with torch.no_grad():
+                _, logits = self.model(input_ids, segment_ids, input_mask,valid_ids=valid_ids)
+                logits = [logit[1: -1] for logit in logits]
+                labels = [self.label_map[label] for label in logits[0]]
+                words = list(text)
+                assert len(labels) == len(words)
 
-        logits_confidence = [values[label].item() for values,label in zip(logits[0],logits_label)]
+                result = []
+                for word, label in zip(words, labels):
+                    if label!='O':
+                        result.append((word,label))
+        else:
+            with torch.no_grad():
+                logits = self.model(input_ids, segment_ids, input_mask,valid_ids)
+            logits = F.softmax(logits,dim=2)
+            logits_label = torch.argmax(logits,dim=2)
+            logits_label = logits_label.detach().cpu().numpy().tolist()[0]
 
-        logits = []
-        pos = 0
-        for index,mask in enumerate(valid_ids[0]):
-            if index == 0:
-                continue
-            if mask == 1:
-                logits.append((logits_label[index-pos],logits_confidence[index-pos]))
-            else:
-                pos += 1
-        logits.pop()
+            logits_confidence = [values[label].item() for values,label in zip(logits[0],logits_label)]
 
-        labels = [(self.label_map[label],confidence) for label,confidence in logits]
-        words = list(text)
-        assert len(labels) == len(words)
+            logits = []
+            pos = 0
+            for index,mask in enumerate(valid_ids[0]):
+                if index == 0:
+                    continue
+                if mask == 1:
+                    logits.append((logits_label[index-pos],logits_confidence[index-pos]))
+                else:
+                    pos += 1
+            logits.pop()
 
-        result = []
-        for word, (label, confidence) in zip(words, labels):
-            if label!='O':
-                result.append((word,label))
+            labels = [(self.label_map[label],confidence) for label,confidence in logits]
+            words = list(text)
+            assert len(labels) == len(words)
+
+            result = []
+            for word, (label, confidence) in zip(words, labels):
+                if label!='O':
+                    result.append((word,label))
+
         tmp = []
         tag = OrderedDict()
         tag['PER'] = []
@@ -141,3 +169,10 @@ class InferNer:
                 tag[wordstype].append(''.join(tmp))
 
         return tag
+
+    def batch_predict(self, text_list):        
+        results = []
+        for text in text_list:
+            tag = self.predict(text)
+            results.append(tag)
+        return results
