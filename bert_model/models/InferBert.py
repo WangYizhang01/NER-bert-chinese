@@ -96,7 +96,9 @@ class InferNer():
             valid_positions.append(0)
         return input_ids,input_mask,segment_ids,valid_positions
 
-    def predict(self, text: str):        
+    def predict(self, text: str):
+        max_seq_length = min(self.max_seq_length - 3, len(text))
+        text = text[:max_seq_length]   
         input_ids,input_mask,segment_ids,valid_ids = self.preprocess(text)
         input_ids = torch.tensor([input_ids],dtype=torch.long,device=self.device)
         input_mask = torch.tensor([input_mask],dtype=torch.long,device=self.device)
@@ -109,7 +111,7 @@ class InferNer():
                 logits = [logit[1: -1] for logit in logits]
                 labels = [self.label_map[label] for label in logits[0]]
                 words = list(text)
-                assert len(labels) == len(words)
+                assert len(labels) == len(words), f'len(labels): {len(labels)}; len(words): {len(words)}'
 
                 result = []
                 for word, label in zip(words, labels):
@@ -137,7 +139,7 @@ class InferNer():
 
             labels = [(self.label_map[label],confidence) for label,confidence in logits]
             words = list(text)
-            assert len(labels) == len(words)
+            assert len(labels) == len(words), f'len(labels): {len(labels)}; len(words): {len(words)}'
 
             result = []
             for word, (label, confidence) in zip(words, labels):
@@ -156,6 +158,8 @@ class InferNer():
                     tmp.append(word)
                 else:
                     wordstype = result[i-1][1][2:]
+                    if wordstype not in ['PER', 'LOC', 'ORG']:
+                        continue
                     tag[wordstype].append(''.join(tmp))
                     tmp.clear()
                     tmp.append(word)
@@ -166,13 +170,23 @@ class InferNer():
                 if label=='B-PER' or label=='B-LOC' or label=='B-ORG':
                     tmp.append(word)
                 wordstype = result[i][1][2:]
+                if wordstype not in ['PER', 'LOC', 'ORG']:
+                    continue
                 tag[wordstype].append(''.join(tmp))
 
         return tag
 
     def batch_predict(self, text_list):        
         results = []
-        for text in text_list:
-            tag = self.predict(text)
-            results.append(tag)
-        return results
+        success_ids = []
+        for i, text in enumerate(text_list):
+            try:
+                tag = self.predict(text)
+                results.append(tag)
+                success_ids.append(1)
+            except:
+                print(f'第{i}个文本 {text} 运行错误，已跳过...')
+                success_ids.append(0)
+
+        print(f'正确处理{sum(success_ids)}个文本...')
+        return results#, success_ids

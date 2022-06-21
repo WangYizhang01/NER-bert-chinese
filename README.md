@@ -3,7 +3,11 @@
 
 # What's New
 
-## Updated June, 2022
+## Updated June 21, 2022
+* 修复了几个bug
+* 增加了对文件进行推理
+
+## Updated June 17, 2022
 * 增加了在bert顶层添加crf层的设计，在给定数据集上实现了average f1  1个点的提升，可通过修改 ./conf/train.yaml 中 use_crf 进行设定
 * 推理时增加了批预测的情形，考虑到推理文本量，实现时未采用批计算的方法，会对推理速度产生影响，后续可考虑实现批计算
 
@@ -48,7 +52,12 @@
 ### 模型内容
 
 BERT
+
 [CRF](https://createmomo.github.io/2017/09/12/CRF_Layer_on_the_Top_of_BiLSTM_1/)
+
+
+### TODO
+* 推理部分实现批处理
 
 
 ### 参考
