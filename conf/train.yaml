@@ -24,3 +24,4 @@ use_gpu: True                # use gpu or not
 warmup_proportion: 0.1
 weight_decay: 0.01
 use_crf: False              # use crf layer or not
+use_span: True             # use span bert or not

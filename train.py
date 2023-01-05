@@ -10,7 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from pytorch_transformers import (WEIGHTS_NAME, AdamW, BertConfig, BertForTokenClassification, BertTokenizer, WarmupLinearSchedule)
-from torch import nn
+import torch.nn as nn
 from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, TensorDataset)
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm, trange
@@ -29,13 +29,19 @@ logger = logging.getLogger(__name__)
 
 
 class TrainNer(BertForTokenClassification):
-    def __init__(self, config, use_crf=False):
+    def __init__(self, config, use_crf=False, use_span=False):
         super(TrainNer, self).__init__(config)
         self.use_crf = use_crf
+        self.use_span = use_span
+
         if self.use_crf:
             self.crf = CRF(config.hidden_size, config.num_labels)
+        
+        if self.use_span:
+            self.startLayer = PollerStartLayer(config.hidden_size, config.num_labels)
+            self.endLayer = PollerEndLayer(config.hidden_size, config.num_labels)
 
-    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=None, attention_mask_label=None, device=None):
+    def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None, valid_ids=None, attention_mask_label=None, device=None, label_start=None, label_end=None):
         sequence_output = self.bert(input_ids, token_type_ids, attention_mask,head_mask=None)[0]
         batch_size,max_len,feat_dim = sequence_output.shape
         valid_output = torch.zeros(batch_size,max_len,feat_dim,dtype=torch.float32,device=device)
@@ -47,7 +53,9 @@ class TrainNer(BertForTokenClassification):
                         valid_output[i][jj] = sequence_output[i][j]
         sequence_output = self.dropout(valid_output) # 32, 128, 768
         
+        # if self.use_crf is True, ignore self.use_span.
         if self.use_crf:
+            # bert-crf
             if labels is not None:
                 masks = input_ids.gt(0)
                 loss = self.crf.loss(sequence_output, labels, masks)
@@ -56,7 +64,32 @@ class TrainNer(BertForTokenClassification):
                 masks = input_ids.gt(0)
                 scores, tag_seq = self.crf(sequence_output, masks)
                 return scores, tag_seq
+        elif self.use_span:
+            # span bert
+            start_logits = self.startLayer(sequence_output)
+            end_logits = self.endLayer(sequence_output)
+
+            if label_start is not None and label_end is not None:
+                loss_fct = nn.CrossEntropyLoss(ignore_index=0)
+
+                if attention_mask_label is not None:
+                    active_loss = attention_mask_label.view(-1) == 1
+                    start_active_logits = start_logits.view(-1, self.num_labels)[active_loss] # 1436, 10
+                    start_active_labels = label_start.view(-1)[active_loss] # 1436
+                    end_active_logits = end_logits.view(-1, self.num_labels)[active_loss] # 1436, 10
+                    end_active_labels = label_end.view(-1)[active_loss] # 1436
+
+                    start_loss = loss_fct(start_active_logits, start_active_labels)
+                    end_loss = loss_fct(end_active_logits, end_active_labels)
+                    loss = start_loss + end_loss
+                else:
+                    loss = loss_fct(start_logits.view(-1, self.num_labels), label_start.view(-1)) + \
+                        loss_fct(end_logits.view(-1, self.num_labels), label_end.view(-1))
+                return loss
+            else:
+                return start_logits, end_logits
         else:
+            # bert
             logits = self.classifier(sequence_output) # 32, 128, 10
 
             if labels is not None: # labels: 32, 128
@@ -71,6 +104,32 @@ class TrainNer(BertForTokenClassification):
                 return loss
             else:
                 return logits
+
+
+class PollerStartLayer(nn.Module):
+    def __init__(self, num_hidden, num_labels):
+        super(PollerStartLayer, self).__init__()
+        self.linear = nn.Linear(num_hidden, num_labels)
+    
+    def forward(self, input):
+        output = self.linear(input)
+        return output
+
+
+class PollerEndLayer(nn.Module):
+    def __init__(self, num_hidden, num_labels):
+        super(PollerEndLayer, self).__init__()
+        self.linear1 = nn.Linear(num_hidden, num_hidden)
+        self.act_func = nn.Tanh()
+        self.layernorm = nn.LayerNorm(num_hidden)
+        self.linear2 = nn.Linear(num_hidden, num_labels)
+    
+    def forward(self, input):
+        output = self.linear1(input)
+        output = self.layernorm(self.act_func(output))
+        output = self.linear2(output)
+        return output
+
 
 wandb.init(project="Bert_NER_Standard")
 @hydra.main(config_path="conf", config_name='config')
@@ -105,8 +164,8 @@ def main(cfg):
 
     # Preprocess the input dataset
     processor = NerProcessor()
-    label_list = processor.get_labels()
-    num_labels = len(label_list) + 1
+    label_list, span_label_list = processor.get_labels()
+    num_labels = len(span_label_list) + 1 if cfg.use_span else len(label_list) + 1
     
     # Prepare the model
     tokenizer = BertTokenizer.from_pretrained(cfg.bert_model, do_lower_case=cfg.do_lower_case)
@@ -120,8 +179,8 @@ def main(cfg):
 
     # 加载预训练模型
     config = BertConfig.from_pretrained(cfg.bert_model, num_labels=num_labels, finetuning_task=cfg.task_name)
-    # model = TrainNer.from_pretrained(cfg.bert_model,from_tf = False,config = config, use_crf = cfg.use_crf)
-    model = TrainNer.from_pretrained('/home/wangyizhang/work/KG/NER-bert-chinese/pretrained/bert-base-chinese',from_tf = False,config = config, use_crf = cfg.use_crf)
+    # model = TrainNer.from_pretrained(cfg.bert_model,from_tf = False,config = config, use_crf = cfg.use_crf, use_apan=cfg.use_span)
+    model = TrainNer.from_pretrained('/home/wangyizhang/work/KG/NER-bert-chinese/pretrained/bert-base-chinese', from_tf=False, config=config, use_crf=cfg.use_crf, use_span=cfg.use_span)
     model.to(device)
 
     param_optimizer = list(model.named_parameters())
@@ -136,18 +195,29 @@ def main(cfg):
     global_step = 0
     nb_tr_steps = 0
     tr_loss = 0
-    label_map = {i : label for i, label in enumerate(label_list,1)}
+    label_map = {i : label for i, label in enumerate(label_list, 1)}
+    span_label_map = {i : label for i, label in enumerate(span_label_list, 1)}
     if cfg.do_train:
-        train_features = convert_examples_to_features(train_examples, label_list, cfg.max_seq_length, tokenizer)
+        if cfg.use_span:
+            train_features = convert_examples_to_features(train_examples, label_list, cfg.max_seq_length, tokenizer, span_label_list)
+        else:
+            train_features = convert_examples_to_features(train_examples, label_list, cfg.max_seq_length, tokenizer)
+        
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
         all_label_ids = torch.tensor([f.label_id for f in train_features], dtype=torch.long)
         all_valid_ids = torch.tensor([f.valid_ids for f in train_features], dtype=torch.long)
         all_lmask_ids = torch.tensor([f.label_mask for f in train_features], dtype=torch.long)
-        train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids,all_valid_ids,all_lmask_ids)
-        train_sampler = RandomSampler(train_data)
         
+        if train_features and train_features[0].label_start:
+            all_label_start = torch.tensor([f.label_start for f in train_features], dtype=torch.long)
+            all_label_end = torch.tensor([f.label_end for f in train_features], dtype=torch.long)
+            train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_valid_ids, all_lmask_ids, all_label_start, all_label_end)
+        else:
+            train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_valid_ids, all_lmask_ids)
+        
+        train_sampler = RandomSampler(train_data)
         train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=cfg.train_batch_size)
 
         model.train()
@@ -157,8 +227,15 @@ def main(cfg):
             nb_tr_examples, nb_tr_steps = 0, 0
             for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
                 batch = tuple(t.to(device) for t in batch)
-                input_ids, input_mask, segment_ids, label_ids, valid_ids,l_mask = batch
-                loss = model(input_ids, segment_ids, input_mask, label_ids,valid_ids,l_mask,device)
+
+                label_start, label_end = None, None
+                if cfg.use_span:
+                    input_ids, input_mask, segment_ids, label_ids, valid_ids, l_mask, label_start, label_end = batch
+                else:
+                    input_ids, input_mask, segment_ids, label_ids, valid_ids, l_mask = batch
+
+                loss = model(input_ids, segment_ids, input_mask, label_ids, valid_ids, l_mask,device, label_start, label_end)
+
                 if cfg.gradient_accumulation_steps > 1:
                     loss = loss / cfg.gradient_accumulation_steps
     
@@ -197,14 +274,26 @@ def main(cfg):
             eval_examples = processor.get_test_examples(utils.get_original_cwd()+'/'+cfg.data_dir)
         else:
             raise ValueError("eval on dev or test set only")
-        eval_features = convert_examples_to_features(eval_examples, label_list, cfg.max_seq_length, tokenizer)
+        
+        if cfg.use_span:
+            eval_features = convert_examples_to_features(eval_examples, label_list, cfg.max_seq_length, tokenizer, span_label_list)
+        else:
+            eval_features = convert_examples_to_features(eval_examples, label_list, cfg.max_seq_length, tokenizer)
+        
         all_input_ids = torch.tensor([f.input_ids for f in eval_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in eval_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in eval_features], dtype=torch.long)
         all_label_ids = torch.tensor([f.label_id for f in eval_features], dtype=torch.long)
         all_valid_ids = torch.tensor([f.valid_ids for f in eval_features], dtype=torch.long)
         all_lmask_ids = torch.tensor([f.label_mask for f in eval_features], dtype=torch.long)
-        eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids,all_valid_ids,all_lmask_ids)
+        
+        if eval_features and eval_features[0].label_start:
+            all_label_start = torch.tensor([f.label_start for f in eval_features], dtype=torch.long)
+            all_label_end = torch.tensor([f.label_end for f in eval_features], dtype=torch.long)
+            eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_valid_ids, all_lmask_ids, all_label_start, all_label_end)
+        else:
+            eval_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_valid_ids, all_lmask_ids)
+
         # Run prediction for full data
         eval_sampler = SequentialSampler(eval_data)
         eval_dataloader = DataLoader(eval_data, sampler=eval_sampler, batch_size=cfg.eval_batch_size)
@@ -213,45 +302,59 @@ def main(cfg):
         nb_eval_steps, nb_eval_examples = 0, 0
         y_true = []
         y_pred = []
-        label_map = {i : label for i, label in enumerate(label_list,1)}
-        for input_ids, input_mask, segment_ids, label_ids,valid_ids,l_mask in tqdm(eval_dataloader, desc="Evaluating"):
-            input_ids = input_ids.to(device)
-            input_mask = input_mask.to(device)
-            segment_ids = segment_ids.to(device)
-            valid_ids = valid_ids.to(device)
-            label_ids = label_ids.to(device)
-            l_mask = l_mask.to(device)
+        label_map = span_label_map if cfg.use_span else label_map
+        for batch in tqdm(eval_dataloader, desc="Evaluating"):
+            batch = tuple(t.to(device) for t in batch)
+
+            if cfg.use_span:
+                input_ids, input_mask, segment_ids, label_ids, valid_ids, l_mask, label_start, label_end = batch
+            else:
+                input_ids, input_mask, segment_ids, label_ids, valid_ids, l_mask = batch
 
             if cfg.use_crf:
                 with torch.no_grad():
                     _, logits = model(input_ids, segment_ids, input_mask,valid_ids=valid_ids,attention_mask_label=l_mask,device=device)
-            else:
+            elif not cfg.use_span:
                 with torch.no_grad():
                     logits = model(input_ids, segment_ids, input_mask,valid_ids=valid_ids,attention_mask_label=l_mask,device=device)
 
                 logits = torch.argmax(F.log_softmax(logits,dim=2),dim=2)
                 logits = logits.detach().cpu().numpy()
-                
-            label_ids = label_ids.to('cpu').numpy() # 8, 128
+            else:
+                with torch.no_grad():
+                    start_logits, end_logits = model(input_ids, segment_ids, input_mask, label_ids, valid_ids, l_mask, device)
+                start_logits = torch.argmax(F.log_softmax(start_logits, dim=2), dim=2).detach().cpu().numpy()
+                end_logits = torch.argmax(F.log_softmax(end_logits, dim=2), dim=2).detach().cpu().numpy()
+            
             input_mask = input_mask.to('cpu').numpy() # 8, 128
 
-            for i, label in enumerate(label_ids):
-                temp_1 = []
-                temp_2 = []
-                for j,m in enumerate(label):
-                    if j == 0:
-                        continue
-                    if label_ids[i][j] == len(label_map):
-                        y_true.append(temp_1)
-                        y_pred.append(temp_2)
-                        break
-                    else:
-                        temp_1.append(label_map[label_ids[i][j]])
-                        
-                        if logits[i][j] != 0:
-                            temp_2.append(label_map[logits[i][j]])
+            def eval_result(logits, label_ids):
+                for i, label in enumerate(label_ids):
+                    temp_1 = []
+                    temp_2 = []
+                    for j,m in enumerate(label):
+                        if j == 0:
+                            continue
+                        if label_ids[i][j] == len(label_map):
+                            y_true.append(temp_1)
+                            y_pred.append(temp_2)
+                            break
                         else:
-                            temp_2.append('0')
+                            temp_1.append(label_map[label_ids[i][j]])
+                            
+                            if logits[i][j] != 0:
+                                temp_2.append(label_map[logits[i][j]])
+                            else:
+                                temp_2.append('0')
+            
+            if cfg.use_span:
+                label_start = label_start.to('cpu').numpy()
+                label_end = label_end.to('cpu').numpy()
+                eval_result(start_logits, label_start)
+                eval_result(end_logits, label_end)
+            else:
+                label_ids = label_ids.to('cpu').numpy() # 8, 128
+                eval_result(logits, label_ids)
 
         report = classification_report(y_true, y_pred, digits=4)
         logger.info("\n%s", report)

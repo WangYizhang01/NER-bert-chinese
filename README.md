@@ -3,6 +3,9 @@
 
 # What's New
 
+## Updated Jan 5, 2023
+* 增加了对指针网络的支持，可通过修改 ./conf/train.yaml 中 use_span 进行设定。注意：use_span 设置为 True 时需提供 label_start、label_end
+
 ## Updated June 21, 2022
 * 修复了几个bug
 * 增加了对文件进行推理
@@ -58,6 +61,10 @@ BERT
 
 ### TODO
 * 推理部分实现批处理
+
+
+### Attention
+* 由于目前的依赖包如 pytorch_transformers 有新的大改版，后续将不再对当前项目进行更新，如果想跟踪项目进展，可参考 https://github.com/WangYizhang01/NER_Span_Bert.
 
 
 ### 参考
